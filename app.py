@@ -177,10 +177,16 @@ def clear_labeled_and_load_next():
     """Clear current batch and load next unlabeled images"""
     # Clear temp files
     for file in os.listdir(TEMP_FOLDER):
+        file_path = os.path.join(TEMP_FOLDER, file)
         try:
-            os.remove(os.path.join(TEMP_FOLDER, file))
-        except:
-            pass
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            st.warning(f"Could not delete {file}: {str(e)}")
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
     
     # Load next batch
     if load_next_batch():
@@ -199,21 +205,30 @@ def load_current_image():
         return
         
     img = st.session_state.images[st.session_state.index]
-    data = download_image(img["id"])
+    
+    try:
+        data = download_image(img["id"])
+        image = Image.open(data)
+        path = os.path.join(TEMP_FOLDER, img["name"])
+        image.save(path)
+        
+        # Close to free memory
+        image.close()
+        data.close()
 
-    image = Image.open(data)
-    path = os.path.join(TEMP_FOLDER, img["name"])
-    image.save(path)
+        st.session_state.current_path = path
+        st.session_state.current_name = img["name"]
 
-    st.session_state.current_path = path
-    st.session_state.current_name = img["name"]
-
-    if img["name"] in st.session_state.labels:
-        st.session_state.current_side = (
-            st.session_state.labels[img["name"]].get("side", "none")
-        )
-    else:
-        st.session_state.current_side = "none"
+        if img["name"] in st.session_state.labels:
+            st.session_state.current_side = (
+                st.session_state.labels[img["name"]].get("side", "none")
+            )
+        else:
+            st.session_state.current_side = "none"
+    except Exception as e:
+        st.error(f"Error loading image: {str(e)}")
+        st.session_state.current_path = ""
+        st.session_state.current_name = img["name"]
 
 
 # =============================
@@ -281,12 +296,16 @@ with tab1:
     if not st.session_state.images:
         st.warning("No unlabeled images in current batch. Click 'Clear & Load Next Batch' to continue.")
         st.stop()
+    
+    if not st.session_state.current_path or not os.path.exists(st.session_state.current_path):
+        st.error("Image not loaded. Please try navigating to another image.")
+        st.stop()
 
     col1, col2 = st.columns([2, 1])
 
     # IMAGE PANEL
     with col1:
-        st.image(st.session_state.current_path, use_container_width=True)
+        st.image(st.session_state.current_path, use_column_width=True)
         st.caption(st.session_state.current_name)
 
         st.progress(
