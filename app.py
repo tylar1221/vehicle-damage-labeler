@@ -29,6 +29,8 @@ if not SERVICE_ACCOUNT_JSON:
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 FIXED_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1xW44N0s4moCUFfD2Q4Vz6tr7gYp9M6BE")
 
+BATCH_SIZE = 50  # Load 50 images at a time
+
 # =============================
 # SUPABASE CONFIG
 # =============================
@@ -46,13 +48,16 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # SESSION STATE
 # =============================
 
-st.session_state.setdefault("images", [])
+st.session_state.setdefault("all_images", [])  # Complete list (metadata only)
+st.session_state.setdefault("current_batch", [])  # Current batch being worked on
+st.session_state.setdefault("batch_start_idx", 0)
 st.session_state.setdefault("index", 0)
 st.session_state.setdefault("labels", {})
 st.session_state.setdefault("current_name", "")
 st.session_state.setdefault("current_side", "none")
 st.session_state.setdefault("filter_unlabeled", False)
 st.session_state.setdefault("current_image_data", None)
+st.session_state.setdefault("images_loaded", False)
 
 # =============================
 # GOOGLE DRIVE
@@ -70,38 +75,37 @@ def drive_service():
 drive = drive_service()
 
 @st.cache_data(show_spinner=False)
-def list_drive_images(folder_id: str) -> List[Dict]:
-    """Fetch ALL images from folder with pagination"""
+def list_all_drive_images(folder_id: str) -> List[Dict]:
+    """Fetch ONLY metadata (id, name) of all images - very lightweight"""
     all_files = []
     page_token = None
     
-    with st.spinner("Loading images from Google Drive..."):
-        while True:
-            try:
-                q = f"'{folder_id}' in parents and trashed=false"
-                res = drive.files().list(
-                    q=q,
-                    fields="nextPageToken, files(id,name,mimeType)",
-                    pageSize=100,
-                    pageToken=page_token
-                ).execute()
-                
-                files = res.get("files", [])
-                image_files = [f for f in files if f["mimeType"].startswith("image/")]
-                all_files.extend(image_files)
-                
-                page_token = res.get("nextPageToken")
-                if not page_token:
-                    break
-                    
-            except Exception as e:
-                st.error(f"Error fetching images: {e}")
+    while True:
+        try:
+            q = f"'{folder_id}' in parents and trashed=false"
+            res = drive.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,mimeType)",
+                pageSize=100,
+                pageToken=page_token
+            ).execute()
+            
+            files = res.get("files", [])
+            image_files = [f for f in files if f["mimeType"].startswith("image/")]
+            all_files.extend(image_files)
+            
+            page_token = res.get("nextPageToken")
+            if not page_token:
                 break
+                
+        except Exception as e:
+            st.error(f"Error fetching images: {e}")
+            break
     
     return all_files
 
 def download_image_as_base64(file_id: str) -> str:
-    """Download image and return as base64 - avoids PIL entirely"""
+    """Download image and return as base64"""
     try:
         request = drive.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -111,7 +115,6 @@ def download_image_as_base64(file_id: str) -> str:
             _, done = downloader.next_chunk()
         fh.seek(0)
         
-        # Convert to base64 without using PIL
         b64_data = base64.b64encode(fh.read()).decode()
         fh.close()
         
@@ -119,6 +122,57 @@ def download_image_as_base64(file_id: str) -> str:
     except Exception as e:
         st.error(f"Error downloading image: {e}")
         return None
+
+# =============================
+# BATCH MANAGEMENT
+# =============================
+
+def load_next_batch():
+    """Load the next batch of images"""
+    start = st.session_state.batch_start_idx
+    end = start + BATCH_SIZE
+    
+    st.session_state.current_batch = st.session_state.all_images[start:end]
+    st.session_state.index = 0
+    
+    if st.session_state.current_batch:
+        load_current_image()
+
+def get_batch_info():
+    """Get current batch information"""
+    total = len(st.session_state.all_images)
+    start = st.session_state.batch_start_idx
+    end = min(start + BATCH_SIZE, total)
+    batch_num = (start // BATCH_SIZE) + 1
+    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    return {
+        "start": start,
+        "end": end,
+        "batch_num": batch_num,
+        "total_batches": total_batches,
+        "total": total
+    }
+
+def has_next_batch():
+    """Check if there's a next batch available"""
+    return st.session_state.batch_start_idx + BATCH_SIZE < len(st.session_state.all_images)
+
+def move_to_next_batch():
+    """Move to next batch"""
+    if has_next_batch():
+        st.session_state.batch_start_idx += BATCH_SIZE
+        load_next_batch()
+        return True
+    return False
+
+def move_to_previous_batch():
+    """Move to previous batch"""
+    if st.session_state.batch_start_idx > 0:
+        st.session_state.batch_start_idx -= BATCH_SIZE
+        load_next_batch()
+        return True
+    return False
 
 # =============================
 # SUPABASE HELPERS
@@ -169,7 +223,7 @@ def get_unlabeled_image_names():
     try:
         res = supabase.table("image_labels").select("image_name").execute()
         labeled_names = {r["image_name"] for r in res.data}
-        all_image_names = {img["name"] for img in st.session_state.images}
+        all_image_names = {img["name"] for img in st.session_state.all_images}
         return all_image_names - labeled_names
     except Exception as e:
         st.error(f"Error getting unlabeled images: {e}")
@@ -177,33 +231,26 @@ def get_unlabeled_image_names():
 
 def get_filtered_images():
     """Return filtered list based on current filter settings"""
-    all_images = st.session_state.images
-    
     if st.session_state.filter_unlabeled:
         unlabeled_names = get_unlabeled_image_names()
-        return [img for img in all_images if img["name"] in unlabeled_names]
+        return [img for img in st.session_state.current_batch if img["name"] in unlabeled_names]
     
-    return all_images
+    return st.session_state.current_batch
 
-def find_next_unlabeled():
-    """Find next unlabeled image from current position"""
+def find_next_unlabeled_in_batch():
+    """Find next unlabeled image in current batch"""
     unlabeled_names = get_unlabeled_image_names()
     
-    for i in range(st.session_state.index + 1, len(st.session_state.images)):
-        img = st.session_state.images[i]
+    for i in range(st.session_state.index + 1, len(st.session_state.current_batch)):
+        img = st.session_state.current_batch[i]
         if img["name"] in unlabeled_names:
             return i
     return None
 
-def jump_to_first_unlabeled():
-    """Jump to the very first unlabeled image"""
+def get_unlabeled_count_in_batch():
+    """Count unlabeled images in current batch"""
     unlabeled_names = get_unlabeled_image_names()
-    
-    for i in range(len(st.session_state.images)):
-        img = st.session_state.images[i]
-        if img["name"] in unlabeled_names:
-            return i
-    return None
+    return sum(1 for img in st.session_state.current_batch if img["name"] in unlabeled_names)
 
 # =============================
 # IMAGE LOADER
@@ -233,12 +280,15 @@ def load_current_image():
 # INITIAL LOAD
 # =============================
 
-if not st.session_state.images:
-    st.session_state.images = list_drive_images(FIXED_FOLDER_ID)
-    st.session_state.labels = load_labels()
-    if st.session_state.images:
-        st.success(f"✅ Loaded {len(st.session_state.images)} images")
-        load_current_image()
+if not st.session_state.images_loaded:
+    with st.spinner("Loading image list from Google Drive..."):
+        st.session_state.all_images = list_all_drive_images(FIXED_FOLDER_ID)
+        st.session_state.labels = load_labels()
+        st.session_state.images_loaded = True
+        
+        if st.session_state.all_images:
+            st.success(f"✅ Found {len(st.session_state.all_images)} total images")
+            load_next_batch()
 
 # =============================
 # UI
@@ -246,12 +296,15 @@ if not st.session_state.images:
 
 st.title("📂 Vehicle Damage Labeler (ICS)")
 
+# Get batch info
+batch_info = get_batch_info()
+
 # Filter controls in sidebar
 with st.sidebar:
-    st.header("🔍 Filters")
+    st.header("📊 Progress")
     
     unlabeled_names = get_unlabeled_image_names()
-    total_images = len(st.session_state.images)
+    total_images = len(st.session_state.all_images)
     unlabeled_count = len(unlabeled_names)
     labeled_count = total_images - unlabeled_count
     
@@ -266,8 +319,31 @@ with st.sidebar:
     
     st.divider()
     
+    # Batch Navigation
+    st.header("📦 Batch Navigation")
+    st.info(f"**Batch {batch_info['batch_num']} of {batch_info['total_batches']}**\n\nImages {batch_info['start']+1} - {batch_info['end']}")
+    
+    unlabeled_in_batch = get_unlabeled_count_in_batch()
+    st.metric("Unlabeled in this batch", unlabeled_in_batch)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("⬅️ Prev\nBatch", use_container_width=True, disabled=st.session_state.batch_start_idx == 0):
+            if move_to_previous_batch():
+                st.rerun()
+    
+    with col2:
+        if st.button("Next\nBatch ➡️", use_container_width=True, disabled=not has_next_batch(), type="primary"):
+            if move_to_next_batch():
+                st.rerun()
+    
+    st.divider()
+    
+    # Filters
+    st.header("🔍 Filters")
+    
     filter_changed = st.checkbox(
-        "Show only unlabeled images",
+        "Show only unlabeled",
         value=st.session_state.filter_unlabeled,
         key="filter_checkbox"
     )
@@ -278,40 +354,24 @@ with st.sidebar:
         load_current_image()
         st.rerun()
     
-    st.divider()
-    
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        if st.button("🎯 Next\nUnlabeled", use_container_width=True):
-            next_idx = find_next_unlabeled()
-            if next_idx is not None:
-                st.session_state.index = next_idx
-                st.session_state.filter_unlabeled = False
-                load_current_image()
-                st.rerun()
-            else:
-                st.info("No more unlabeled!")
-    
-    with col_b:
-        if st.button("⏮️ First\nUnlabeled", use_container_width=True):
-            first_idx = jump_to_first_unlabeled()
-            if first_idx is not None:
-                st.session_state.index = first_idx
-                st.session_state.filter_unlabeled = False
-                load_current_image()
-                st.rerun()
-            else:
-                st.info("All labeled!")
+    if st.button("🎯 Next Unlabeled", use_container_width=True):
+        next_idx = find_next_unlabeled_in_batch()
+        if next_idx is not None:
+            st.session_state.index = next_idx
+            load_current_image()
+            st.rerun()
+        else:
+            st.info("No more in batch!")
     
     st.divider()
+    
     current_img_name = st.session_state.current_name
     if current_img_name in unlabeled_names:
         st.warning("⚠️ Current: UNLABELED")
     else:
         st.success("✅ Current: LABELED")
     
-    if st.button("🔄 Refresh", use_container_width=True):
+    if st.button("🔄 Refresh Data", use_container_width=True):
         load_labels.clear()
         get_unlabeled_image_names.clear()
         st.session_state.labels = load_labels()
@@ -327,7 +387,8 @@ with tab1:
     filtered_images = get_filtered_images()
     
     if not filtered_images:
-        st.warning("No images found with current filter")
+        st.warning("No images in current batch match the filter")
+        st.info("Try changing the filter or moving to a different batch")
         st.stop()
     
     col1, col2 = st.columns([2, 1])
@@ -335,7 +396,6 @@ with tab1:
     # ---- IMAGE PANEL ----
     with col1:
         if st.session_state.current_image_data:
-            # Display image using base64 - avoids PIL corruption
             st.markdown(
                 f'<img src="data:image/jpeg;base64,{st.session_state.current_image_data}" style="width: 100%; border-radius: 8px;">',
                 unsafe_allow_html=True
@@ -343,9 +403,9 @@ with tab1:
         else:
             st.warning("Image not loaded")
             
-        st.caption(st.session_state.current_name)
+        st.caption(f"**{st.session_state.current_name}**")
         st.progress((st.session_state.index + 1) / len(filtered_images))
-        st.caption(f"Image {st.session_state.index + 1} of {len(filtered_images)}")
+        st.caption(f"Image {st.session_state.index + 1} of {len(filtered_images)} in current view")
     
     # ---- LABEL PANEL ----
     with col2:
@@ -364,7 +424,7 @@ with tab1:
             "back": "🔽",
             "left": "◀️",
             "right": "▶️",
-            "NONE": "⚠️"
+            "none": "⚠️"
         }
         
         for idx, (side_key, side_icon) in enumerate(sides.items()):
