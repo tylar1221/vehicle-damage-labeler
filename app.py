@@ -1,16 +1,74 @@
-# =============================
-# GOOGLE DRIVE HELPERS
-# =============================
+import streamlit as st
+import os
+import io
+import json
+from PIL import Image
+from typing import List, Dict
+from supabase import create_client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+import pandas as pd
 
-import io
-import os
-from typing import List, Dict
-from PIL import Image
 
+# =============================
+# PAGE CONFIG
+# =============================
+st.set_page_config(
+    page_title="Google Drive Image Labeler",
+    page_icon="📂",
+    layout="wide",
+)
+
+
+# =============================
+# CONFIG
+# =============================
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+if not SERVICE_ACCOUNT_JSON:
+    st.error("Missing GOOGLE_SERVICE_ACCOUNT_JSON environment variable")
+    st.stop()
+
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+FIXED_FOLDER_ID = os.getenv(
+    "GOOGLE_DRIVE_FOLDER_ID",
+    "1xW44N0s4moCUFfD2Q4Vz6tr7gYp9M6BE",
+)
+
+TEMP_FOLDER = "./temp_drive"
+os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+
+# =============================
+# SUPABASE CONFIG
+# =============================
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Missing Supabase credentials in environment variables")
+    st.stop()
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# =============================
+# SESSION STATE
+# =============================
+st.session_state.setdefault("images", [])
+st.session_state.setdefault("index", 0)
+st.session_state.setdefault("labels", {})
+st.session_state.setdefault("current_path", "")
+st.session_state.setdefault("current_name", "")
+st.session_state.setdefault("current_side", "none")
+
+
+# =============================
+# GOOGLE DRIVE
+# =============================
+@st.cache_resource
 def drive_service():
+    service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
     creds = service_account.Credentials.from_service_account_info(
         service_account_info,
         scopes=SCOPES,
@@ -93,10 +151,9 @@ def load_current_image():
     st.session_state.current_path = path
     st.session_state.current_name = img["name"]
 
-    # Load existing side if available
     if img["name"] in st.session_state.labels:
-        st.session_state.current_side = st.session_state.labels[img["name"]].get(
-            "side", "none"
+        st.session_state.current_side = (
+            st.session_state.labels[img["name"]].get("side", "none")
         )
     else:
         st.session_state.current_side = "none"
@@ -118,7 +175,6 @@ if not st.session_state.images:
 # UI
 # =============================
 st.title("📂 Vehicle Damage Labeler (ICS)")
-
 tab1, tab2 = st.tabs(["🏷️ Labeling", "📊 Live Preview"])
 
 
@@ -132,22 +188,26 @@ with tab1:
 
     col1, col2 = st.columns([2, 1])
 
-    # ---- IMAGE PANEL ----
+    # IMAGE PANEL
     with col1:
         st.image(st.session_state.current_path, use_container_width=True)
         st.caption(st.session_state.current_name)
 
         st.progress(
-            (st.session_state.index + 1) / len(st.session_state.images)
-        )
-        st.caption(
-            f"Image {st.session_state.index + 1} of {len(st.session_state.images)}"
+            (st.session_state.index + 1)
+            / len(st.session_state.images)
         )
 
-    # ---- LABEL PANEL ----
+        st.caption(
+            f"Image {st.session_state.index + 1} "
+            f"of {len(st.session_state.images)}"
+        )
+
+    # LABEL PANEL
     with col2:
         existing_data = st.session_state.labels.get(
-            st.session_state.current_name, {}
+            st.session_state.current_name,
+            {},
         )
 
         existing_desc = existing_data.get("description", "")
@@ -156,7 +216,6 @@ with tab1:
         if existing_desc:
             st.info("📝 This image already has a label")
 
-        # SIDE SELECTION
         st.subheader("🚗 Vehicle Side")
         side_cols = st.columns(5)
 
@@ -174,21 +233,23 @@ with tab1:
                     side_label,
                     key=f"side_{side_key}",
                     use_container_width=True,
-                    type="primary" if existing_side == side_key else "secondary",
+                    type="primary"
+                    if existing_side == side_key
+                    else "secondary",
                 ):
                     st.session_state.current_side = side_key
                     st.rerun()
 
         if st.session_state.current_side != "none":
             st.success(
-                f"Selected: **{st.session_state.current_side.upper()}**"
+                f"Selected: "
+                f"**{st.session_state.current_side.upper()}**"
             )
         else:
             st.warning("⚠️ No side selected")
 
         st.divider()
 
-        # DAMAGE DESCRIPTION
         label = st.text_area(
             "Damage Description",
             value=existing_desc,
@@ -198,7 +259,6 @@ with tab1:
 
         st.divider()
 
-        # ---- MAIN ACTION BUTTONS ----
         b1, b2, b3 = st.columns([1, 2, 1])
 
         with b1:
@@ -219,12 +279,14 @@ with tab1:
             next_clicked = st.button(
                 "➡️ Next",
                 use_container_width=True,
-                disabled=st.session_state.index == len(st.session_state.images) - 1,
+                disabled=(
+                    st.session_state.index
+                    == len(st.session_state.images) - 1
+                ),
             )
 
         st.divider()
 
-        # ---- SAFE SKIP ----
         skip_confirm = st.checkbox("Confirm skip (save as None)")
         skip_clicked = st.button(
             "⏭️ Skip Image",
@@ -232,7 +294,6 @@ with tab1:
             disabled=not skip_confirm,
         )
 
-        # ---- LOGIC ----
         if prev_clicked:
             st.session_state.index -= 1
             load_current_image()
@@ -246,7 +307,10 @@ with tab1:
                     st.session_state.current_side,
                 )
 
-                if st.session_state.index < len(st.session_state.images) - 1:
+                if (
+                    st.session_state.index
+                    < len(st.session_state.images) - 1
+                ):
                     st.session_state.index += 1
                     load_current_image()
 
@@ -267,7 +331,10 @@ with tab1:
                 "none",
             )
 
-            if st.session_state.index < len(st.session_state.images) - 1:
+            if (
+                st.session_state.index
+                < len(st.session_state.images) - 1
+            ):
                 st.session_state.index += 1
                 load_current_image()
 
@@ -281,7 +348,13 @@ with tab1:
 with tab2:
     st.header("📊 Live Supabase Data")
 
-    data = supabase.table("image_labels").select("*").execute().data
+    data = (
+        supabase.table("image_labels")
+        .select("*")
+        .execute()
+        .data
+    )
+
     df = pd.DataFrame(data)
 
     if not df.empty:
@@ -295,7 +368,9 @@ with tab2:
             st.metric("Images with Side Selected", labeled)
 
         with col3:
-            sides_count = df[df["side"] != "none"]["side"].value_counts()
+            sides_count = (
+                df[df["side"] != "none"]["side"].value_counts()
+            )
             if not sides_count.empty:
                 st.metric(
                     "Most Common Side",
