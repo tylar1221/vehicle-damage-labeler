@@ -1,253 +1,486 @@
 import streamlit as st
-import os, io, json, gc
+import os
+import io
+import json
 from PIL import Image
+from typing import List, Dict
 from supabase import create_client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import pandas as pd
 
-# =====================================================
-# PAGE CONFIG (SAFE)
-# =====================================================
+
+# =============================
+# PAGE CONFIG
+# =============================
 st.set_page_config(
     page_title="Google Drive Image Labeler",
     page_icon="📂",
     layout="wide",
 )
 
-# =====================================================
-# CONSTANTS
-# =====================================================
-BATCH_SIZE = 40                  # SAFE batch size
-TEMP_FOLDER = "/tmp/drive_imgs"  # Streamlit Cloud safe
-MAX_IMAGE_SIZE = (1600, 1600)
 
+# =============================
+# CONFIG
+# =============================
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+if not SERVICE_ACCOUNT_JSON:
+    st.error("Missing GOOGLE_SERVICE_ACCOUNT_JSON environment variable")
+    st.stop()
+
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+FIXED_FOLDER_ID = os.getenv(
+    "GOOGLE_DRIVE_FOLDER_ID",
+    "1xW44N0s4moCUFfD2Q4Vz6tr7gYp9M6BE",
+)
+
+TEMP_FOLDER = "./temp_drive"
 os.makedirs(TEMP_FOLDER, exist_ok=True)
 
-# =====================================================
-# ENV CHECK (NO NETWORK CALLS HERE)
-# =====================================================
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+# Pagination settings
+BATCH_SIZE = 50  # Number of images to load at once
+
+
+# =============================
+# SUPABASE CONFIG
+# =============================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-missing = []
-if not SERVICE_ACCOUNT_JSON: missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
-if not DRIVE_FOLDER_ID: missing.append("GOOGLE_DRIVE_FOLDER_ID")
-if not SUPABASE_URL: missing.append("SUPABASE_URL")
-if not SUPABASE_KEY: missing.append("SUPABASE_KEY")
-
-if missing:
-    st.error(f"Missing env vars: {', '.join(missing)}")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Missing Supabase credentials in environment variables")
     st.stop()
 
-# =====================================================
-# SESSION STATE (LIGHTWEIGHT)
-# =====================================================
-defaults = {
-    "started": False,
-    "drive": None,
-    "images": [],
-    "index": 0,
-    "labels": {},
-    "next_token": None,
-    "current_path": "",
-    "current_name": "",
-    "current_side": "none",
-}
-for k, v in defaults.items():
-    st.session_state.setdefault(k, v)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# =====================================================
-# SAFE START GATE (CRITICAL FOR CLOUD)
-# =====================================================
-st.title("📂 Vehicle Damage Labeler (Cloud Safe)")
 
-if not st.session_state.started:
-    st.info("Click start to initialize Google Drive & Supabase")
-    if st.button("🚀 Start Labeling Session"):
-        st.session_state.started = True
-        st.rerun()
-    st.stop()   # <<< HEALTH CHECK PASSES HERE
+# =============================
+# SESSION STATE
+# =============================
+st.session_state.setdefault("images", [])
+st.session_state.setdefault("all_images", [])
+st.session_state.setdefault("batch_start", 0)
+st.session_state.setdefault("index", 0)
+st.session_state.setdefault("labels", {})
+st.session_state.setdefault("current_path", "")
+st.session_state.setdefault("current_name", "")
+st.session_state.setdefault("current_side", "none")
 
-# =====================================================
-# LAZY GOOGLE DRIVE
-# =====================================================
+
+# =============================
+# GOOGLE DRIVE
+# =============================
 @st.cache_resource
-def create_drive():
+def drive_service():
+    service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(SERVICE_ACCOUNT_JSON),
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        service_account_info,
+        scopes=SCOPES,
     )
     return build("drive", "v3", credentials=creds)
 
-def get_drive():
-    if st.session_state.drive is None:
-        st.session_state.drive = create_drive()
-    return st.session_state.drive
 
-# =====================================================
-# SUPABASE (LAZY SAFE)
-# =====================================================
-@st.cache_resource
-def get_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+drive = drive_service()
 
-supabase = get_supabase()
 
-# =====================================================
-# HELPERS
-# =====================================================
-def clear_temp():
-    for f in os.listdir(TEMP_FOLDER):
-        try:
-            os.remove(os.path.join(TEMP_FOLDER, f))
-        except:
-            pass
-    gc.collect()
+def list_drive_images(folder_id: str) -> List[Dict]:
+    q = f"'{folder_id}' in parents and trashed=false"
+    res = (
+        drive.files()
+        .list(q=q, fields="files(id,name,mimeType)", pageSize=1000)
+        .execute()
+    )
 
-def list_drive_batch(page_token=None):
-    drive = get_drive()
-    res = drive.files().list(
-        q=f"'{DRIVE_FOLDER_ID}' in parents and trashed=false",
-        fields="nextPageToken, files(id,name,mimeType)",
-        pageSize=BATCH_SIZE,
-        pageToken=page_token,
-    ).execute()
-
-    images = [
+    return [
         f for f in res.get("files", [])
         if f["mimeType"].startswith("image/")
     ]
-    return images, res.get("nextPageToken")
 
-def download_image(file_id, name):
-    drive = get_drive()
-    req = drive.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, req)
+
+def download_image(file_id: str) -> io.BytesIO:
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
 
     done = False
     while not done:
         _, done = downloader.next_chunk()
 
-    buf.seek(0)
-    with Image.open(buf) as img:
-        img = img.convert("RGB")
-        img.thumbnail(MAX_IMAGE_SIZE)
-        path = os.path.join(TEMP_FOLDER, name)
-        img.save(path, "JPEG", quality=85, optimize=True)
+    fh.seek(0)
+    return fh
 
-    buf.close()
-    gc.collect()
-    return path
 
+# =============================
+# SUPABASE HELPERS
+# =============================
 def load_labels():
-    try:
-        res = supabase.table("image_labels").select("*").execute()
-        return {
-            r["image_name"]: {
-                "description": r["description"],
-                "side": r.get("side", "none"),
-            }
-            for r in res.data
-        }
-    except:
-        return {}
+    res = supabase.table("image_labels").select("*").execute()
+    labels = {}
 
-def save_label(name, desc, side):
-    supabase.table("image_labels").upsert({
-        "image_name": name,
-        "description": desc,
-        "side": side,
-    }).execute()
+    for r in res.data:
+        labels[r["image_name"]] = {
+            "description": r["description"],
+            "side": r.get("side", "none"),
+        }
+
+    return labels
+
+
+def save_label(name: str, desc: str, side: str):
+    supabase.table("image_labels").upsert(
+        {
+            "image_name": name,
+            "description": desc,
+            "side": side,
+        }
+    ).execute()
 
     st.session_state.labels[name] = {
         "description": desc,
         "side": side,
     }
 
-def load_current():
-    img = st.session_state.images[st.session_state.index]
-    st.session_state.current_path = download_image(img["id"], img["name"])
-    st.session_state.current_name = img["name"]
-    st.session_state.current_side = (
-        st.session_state.labels.get(img["name"], {}).get("side", "none")
-    )
+
+# =============================
+# BATCH MANAGEMENT
+# =============================
+def get_unlabeled_images():
+    """Filter out already labeled images from all_images"""
+    labeled_names = set(st.session_state.labels.keys())
+    return [
+        img for img in st.session_state.all_images
+        if img["name"] not in labeled_names
+    ]
+
 
 def load_next_batch():
-    clear_temp()
-    imgs, token = list_drive_batch(st.session_state.next_token)
-    st.session_state.images = imgs
+    """Load the next batch of unlabeled images"""
+    unlabeled = get_unlabeled_images()
+    
+    if not unlabeled:
+        st.session_state.images = []
+        return False
+    
+    # Load next batch
+    end_idx = min(BATCH_SIZE, len(unlabeled))
+    st.session_state.images = unlabeled[:end_idx]
     st.session_state.index = 0
-    st.session_state.next_token = token
-    if imgs:
-        load_current()
+    
+    if st.session_state.images:
+        load_current_image()
+    
+    return True
 
-def batch_done():
-    return all(i["name"] in st.session_state.labels for i in st.session_state.images)
 
-# =====================================================
-# INITIAL LOAD (AFTER START BUTTON)
-# =====================================================
-if not st.session_state.images:
-    with st.spinner("Initializing batch..."):
+def clear_labeled_and_load_next():
+    """Clear current batch and load next unlabeled images"""
+    # Clear temp files
+    for file in os.listdir(TEMP_FOLDER):
+        try:
+            os.remove(os.path.join(TEMP_FOLDER, file))
+        except:
+            pass
+    
+    # Load next batch
+    if load_next_batch():
+        st.success(f"✅ Loaded next batch of {len(st.session_state.images)} images")
+        return True
+    else:
+        st.info("🎉 All images have been labeled!")
+        return False
+
+
+# =============================
+# IMAGE LOADER
+# =============================
+def load_current_image():
+    if not st.session_state.images:
+        return
+        
+    img = st.session_state.images[st.session_state.index]
+    data = download_image(img["id"])
+
+    image = Image.open(data)
+    path = os.path.join(TEMP_FOLDER, img["name"])
+    image.save(path)
+
+    st.session_state.current_path = path
+    st.session_state.current_name = img["name"]
+
+    if img["name"] in st.session_state.labels:
+        st.session_state.current_side = (
+            st.session_state.labels[img["name"]].get("side", "none")
+        )
+    else:
+        st.session_state.current_side = "none"
+
+
+# =============================
+# INITIAL LOAD
+# =============================
+if not st.session_state.all_images:
+    with st.spinner("Loading images from Google Drive..."):
+        st.session_state.all_images = list_drive_images(FIXED_FOLDER_ID)
         st.session_state.labels = load_labels()
+        
+        # Load first batch of unlabeled images
         load_next_batch()
 
-# =====================================================
-# UI
-# =====================================================
-tab1, tab2 = st.tabs(["🏷️ Labeling", "📊 Live Data"])
 
-# ---------------- LABELING TAB ----------------
+# =============================
+# UI
+# =============================
+st.title("📂 Vehicle Damage Labeler (ICS)")
+
+# Add stats in sidebar
+with st.sidebar:
+    st.header("📊 Progress Stats")
+    
+    total_images = len(st.session_state.all_images)
+    labeled_count = len(st.session_state.labels)
+    unlabeled_count = len(get_unlabeled_images())
+    current_batch_size = len(st.session_state.images)
+    
+    st.metric("Total Images", total_images)
+    st.metric("Labeled", labeled_count)
+    st.metric("Remaining", unlabeled_count)
+    st.metric("Current Batch", current_batch_size)
+    
+    if labeled_count > 0:
+        progress = (labeled_count / total_images) * 100
+        st.progress(progress / 100)
+        st.caption(f"{progress:.1f}% Complete")
+    
+    st.divider()
+    
+    # Batch control
+    st.subheader("🔄 Batch Control")
+    
+    if current_batch_size > 0:
+        labeled_in_batch = sum(
+            1 for img in st.session_state.images
+            if img["name"] in st.session_state.labels
+        )
+        st.info(f"{labeled_in_batch}/{current_batch_size} labeled in current batch")
+    
+    if st.button("🗑️ Clear & Load Next Batch", type="primary", use_container_width=True):
+        clear_labeled_and_load_next()
+        st.rerun()
+    
+    st.caption("💡 Use this to free memory and load new unlabeled images")
+
+
+tab1, tab2 = st.tabs(["🏷️ Labeling", "📊 Live Preview"])
+
+
+# =============================
+# TAB 1 — LABELING
+# =============================
 with tab1:
+    if not st.session_state.images:
+        st.warning("No unlabeled images in current batch. Click 'Clear & Load Next Batch' to continue.")
+        st.stop()
+
     col1, col2 = st.columns([2, 1])
 
+    # IMAGE PANEL
     with col1:
-        st.image(st.session_state.current_path, width="stretch")
+        st.image(st.session_state.current_path, use_container_width=True)
         st.caption(st.session_state.current_name)
-        st.progress((st.session_state.index + 1) / len(st.session_state.images))
 
-    with col2:
-        desc = st.text_area("Damage Description", height=120)
-        side = st.radio(
-            "Vehicle Side",
-            ["front", "back", "left", "right", "none"],
-            index=["front","back","left","right","none"].index(
-                st.session_state.current_side
-            ),
+        st.progress(
+            (st.session_state.index + 1)
+            / len(st.session_state.images)
         )
 
-        if st.button("💾 Save & Next", type="primary"):
-            save_label(st.session_state.current_name, desc or "None", side)
+        st.caption(
+            f"Image {st.session_state.index + 1} "
+            f"of {len(st.session_state.images)} (Current Batch)"
+        )
 
-            if st.session_state.index < len(st.session_state.images) - 1:
-                st.session_state.index += 1
-                load_current()
+    # LABEL PANEL
+    with col2:
+        existing_data = st.session_state.labels.get(
+            st.session_state.current_name,
+            {},
+        )
 
+        existing_desc = existing_data.get("description", "")
+        existing_side = existing_data.get("side", "none")
+
+        if existing_desc:
+            st.info("📝 This image already has a label")
+
+        st.subheader("🚗 Vehicle Side")
+        side_cols = st.columns(5)
+
+        sides = {
+            "front": "🔼 Front",
+            "back": "🔽 Back",
+            "left": "◀️ Left",
+            "right": "▶️ Right",
+            "none": "⚠️ NONE",
+        }
+
+        for idx, (side_key, side_label) in enumerate(sides.items()):
+            with side_cols[idx]:
+                if st.button(
+                    side_label,
+                    key=f"side_{side_key}",
+                    use_container_width=True,
+                    type="primary"
+                    if existing_side == side_key
+                    else "secondary",
+                ):
+                    st.session_state.current_side = side_key
+                    st.rerun()
+
+        if st.session_state.current_side != "none":
+            st.success(
+                f"Selected: "
+                f"**{st.session_state.current_side.upper()}**"
+            )
+        else:
+            st.warning("⚠️ No side selected")
+
+        st.divider()
+
+        label = st.text_area(
+            "Damage Description",
+            value=existing_desc,
+            height=120,
+            placeholder="e.g. Front bumper dented, headlight cracked",
+        )
+
+        st.divider()
+
+        b1, b2, b3 = st.columns([1, 2, 1])
+
+        with b1:
+            prev_clicked = st.button(
+                "⬅️ Prev",
+                use_container_width=True,
+                disabled=st.session_state.index == 0,
+            )
+
+        with b2:
+            save_clicked = st.button(
+                "💾 Save & Next",
+                type="primary",
+                use_container_width=True,
+            )
+
+        with b3:
+            next_clicked = st.button(
+                "➡️ Next",
+                use_container_width=True,
+                disabled=(
+                    st.session_state.index
+                    == len(st.session_state.images) - 1
+                ),
+            )
+
+        st.divider()
+
+        skip_confirm = st.checkbox("Confirm skip (save as None)")
+        skip_clicked = st.button(
+            "⏭️ Skip Image",
+            use_container_width=True,
+            disabled=not skip_confirm,
+        )
+
+        if prev_clicked:
+            st.session_state.index -= 1
+            load_current_image()
             st.rerun()
 
-    if batch_done():
-        st.success("✅ Batch completed")
-        if st.session_state.next_token:
-            if st.button("➡ Load Next Batch"):
-                load_next_batch()
-                st.rerun()
-        else:
-            st.balloons()
-            st.success("🎉 All images labeled")
+        if save_clicked:
+            if label.strip():
+                save_label(
+                    st.session_state.current_name,
+                    label.strip(),
+                    st.session_state.current_side,
+                )
 
-# ---------------- LIVE DATA TAB ----------------
+                if (
+                    st.session_state.index
+                    < len(st.session_state.images) - 1
+                ):
+                    st.session_state.index += 1
+                    load_current_image()
+
+                st.success("Saved ✔")
+                st.rerun()
+            else:
+                st.warning("Please enter a description")
+
+        if next_clicked:
+            st.session_state.index += 1
+            load_current_image()
+            st.rerun()
+
+        if skip_clicked:
+            save_label(
+                st.session_state.current_name,
+                "None",
+                "none",
+            )
+
+            if (
+                st.session_state.index
+                < len(st.session_state.images) - 1
+            ):
+                st.session_state.index += 1
+                load_current_image()
+
+            st.warning("Skipped")
+            st.rerun()
+
+
+# =============================
+# TAB 2 — LIVE DATA
+# =============================
 with tab2:
-    data = supabase.table("image_labels").select("*").execute().data
+    st.header("📊 Live Supabase Data")
+
+    data = (
+        supabase.table("image_labels")
+        .select("*")
+        .execute()
+        .data
+    )
+
     df = pd.DataFrame(data)
 
     if not df.empty:
-        st.metric("Total Labels", len(df))
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("Total Labeled Images", len(df))
+
+        with col2:
+            labeled = len(df[df["side"] != "none"])
+            st.metric("Images with Side Selected", labeled)
+
+        with col3:
+            sides_count = (
+                df[df["side"] != "none"]["side"].value_counts()
+            )
+            if not sides_count.empty:
+                st.metric(
+                    "Most Common Side",
+                    sides_count.index[0].upper(),
+                )
+
+        st.subheader("Side Distribution")
         st.bar_chart(df["side"].value_counts())
-        st.dataframe(df, width="stretch")
+
+        st.divider()
+        st.subheader("All Labels")
+        st.dataframe(df, use_container_width=True)
+
     else:
         st.info("No labels yet")
+
+    st.caption("⚡ Realtime labeling powered by Streamlit + Supabase")
