@@ -1,15 +1,17 @@
-
-import streamlit as st
 import os
 import io
 import json
-from PIL import Image
 from typing import List, Dict
+
+import streamlit as st
+import pandas as pd
+from PIL import Image
+
 from supabase import create_client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import pandas as pd
+
 
 # =============================
 # PAGE CONFIG
@@ -20,6 +22,7 @@ st.set_page_config(
     layout="wide",
 )
 
+
 # =============================
 # CONFIG
 # =============================
@@ -29,6 +32,7 @@ if not SERVICE_ACCOUNT_JSON:
     st.stop()
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
 FIXED_FOLDER_ID = os.getenv(
     "GOOGLE_DRIVE_FOLDER_ID",
     "1xW44N0s4moCUFfD2Q4Vz6tr7gYp9M6BE",
@@ -36,6 +40,7 @@ FIXED_FOLDER_ID = os.getenv(
 
 TEMP_FOLDER = "./temp_drive"
 os.makedirs(TEMP_FOLDER, exist_ok=True)
+
 
 # =============================
 # SUPABASE CONFIG
@@ -49,6 +54,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
 # =============================
 # SESSION STATE
 # =============================
@@ -59,6 +65,7 @@ st.session_state.setdefault("labels", {})
 st.session_state.setdefault("current_path", "")
 st.session_state.setdefault("current_name", "")
 st.session_state.setdefault("current_side", "none")
+
 
 # =============================
 # GOOGLE DRIVE
@@ -71,22 +78,32 @@ def drive_service():
     )
     return build("drive", "v3", credentials=creds)
 
+
 drive = drive_service()
+
 
 def list_drive_images(folder_id: str) -> List[Dict]:
     images = []
     page_token = None
 
     while True:
-        res = drive.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id,name,mimeType)",
-            pageToken=page_token,
-            pageSize=1000,
-        ).execute()
+        res = (
+            drive.files()
+            .list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="nextPageToken, files(id,name,mimeType)",
+                pageToken=page_token,
+                pageSize=1000,
+            )
+            .execute()
+        )
 
         images.extend(
-            [f for f in res.get("files", []) if f["mimeType"].startswith("image/")]
+            [
+                f
+                for f in res.get("files", [])
+                if f["mimeType"].startswith("image/")
+            ]
         )
 
         page_token = res.get("nextPageToken")
@@ -95,15 +112,19 @@ def list_drive_images(folder_id: str) -> List[Dict]:
 
     return images
 
+
 def download_image(file_id: str) -> io.BytesIO:
     request = drive.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
+
     done = False
     while not done:
         _, done = downloader.next_chunk()
+
     fh.seek(0)
     return fh
+
 
 # =============================
 # SUPABASE HELPERS
@@ -118,28 +139,34 @@ def load_labels():
         for r in res.data
     }
 
-def get_labeled_image_names():
-    res = supabase.table("image_labels") \
-        .select("image_name, description") \
-        .execute()
 
+def get_labeled_image_names():
+    res = (
+        supabase.table("image_labels")
+        .select("image_name, description")
+        .execute()
+    )
     return {
         r["image_name"]
         for r in res.data
         if r["description"] and r["description"] != "None"
     }
 
+
 def save_label(name: str, desc: str, side: str):
-    supabase.table("image_labels").upsert({
-        "image_name": name,
-        "description": desc,
-        "side": side,
-    }).execute()
+    supabase.table("image_labels").upsert(
+        {
+            "image_name": name,
+            "description": desc,
+            "side": side,
+        }
+    ).execute()
 
     st.session_state.labels[name] = {
         "description": desc,
         "side": side,
     }
+
 
 # =============================
 # IMAGE LOADER
@@ -161,6 +188,7 @@ def load_current_image():
     label = st.session_state.labels.get(img["name"])
     st.session_state.current_side = label["side"] if label else "none"
 
+
 # =============================
 # INITIAL LOAD (AUTO RESUME)
 # =============================
@@ -169,21 +197,24 @@ if not st.session_state.all_images:
         st.session_state.all_images = list_drive_images(FIXED_FOLDER_ID)
         st.session_state.labels = load_labels()
 
-    labeled_names = {
-        name for name, v in st.session_state.labels.items()
-        if v["description"] != "None"
-    }
+        labeled_names = {
+            name
+            for name, v in st.session_state.labels.items()
+            if v["description"] != "None"
+        }
 
-    for i, img in enumerate(st.session_state.all_images):
-        if img["name"] not in labeled_names:
-            st.session_state.index = i
-            break
+        for i, img in enumerate(st.session_state.all_images):
+            if img["name"] not in labeled_names:
+                st.session_state.index = i
+                break
+
 
 # =============================
 # UI
 # =============================
 st.title("📂 Vehicle Damage Labeler (ICS)")
 tab1, tab2 = st.tabs(["🏷️ Labeling", "📊 Live Preview"])
+
 
 # =============================
 # TAB 1 — LABELING
@@ -199,7 +230,8 @@ with tab1:
 
     if filter_mode == "Only Unlabeled":
         st.session_state.images = [
-            img for img in st.session_state.all_images
+            img
+            for img in st.session_state.all_images
             if img["name"] not in labeled_names
         ]
         st.session_state.index = 0
@@ -218,24 +250,37 @@ with tab1:
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        st.image(st.session_state.current_path, use_container_width=True)
+        st.image(
+            st.session_state.current_path,
+            use_container_width=True,
+        )
         st.caption(st.session_state.current_name)
-        st.progress((st.session_state.index + 1) / len(st.session_state.images))
-        st.caption(f"{st.session_state.index + 1} of {len(st.session_state.images)}")
+        st.progress(
+            (st.session_state.index + 1)
+            / len(st.session_state.images)
+        )
+        st.caption(
+            f"{st.session_state.index + 1} of {len(st.session_state.images)}"
+        )
 
     with col2:
-        existing = st.session_state.labels.get(st.session_state.current_name, {})
+        existing = st.session_state.labels.get(
+            st.session_state.current_name, {}
+        )
         desc = existing.get("description", "")
 
-        # st.subheader("🚗 Vehicle Side")
-        # side = st.radio(
-        #     "Side",
-        #     ["front", "back", "left", "right", "none"],
-        #     index=["front", "back", "left", "right", "none"].index(
-        #         st.session_state.current_side
-        #     ),
-        # )
-        
+        st.subheader("🚗 Vehicle Side")
+        side = st.radio(
+            "Side",
+            ["front", "back", "left", "right", "none"],
+            index=[
+                "front",
+                "back",
+                "left",
+                "right",
+                "none",
+            ].index(st.session_state.current_side),
+        )
 
         label = st.text_area(
             "Damage Description",
@@ -269,10 +314,12 @@ with tab1:
         with b3:
             if st.button(
                 "➡️ Next",
-                disabled=st.session_state.index == len(st.session_state.images) - 1,
+                disabled=st.session_state.index
+                == len(st.session_state.images) - 1,
             ):
                 st.session_state.index += 1
                 st.rerun()
+
 
 # =============================
 # TAB 2 — LIVE DATA
@@ -280,19 +327,30 @@ with tab1:
 with tab2:
     st.header("📊 Live Supabase Data")
 
-    data = supabase.table("image_labels").select("*").execute().data
+    data = (
+        supabase.table("image_labels")
+        .select("*")
+        .execute()
+        .data
+    )
     df = pd.DataFrame(data)
 
     if not df.empty:
         c1, c2, c3 = st.columns(3)
+
         with c1:
             st.metric("Total Labeled", len(df))
+
         with c2:
-            st.metric("Total Images", len(st.session_state.all_images))
+            st.metric(
+                "Total Images",
+                len(st.session_state.all_images),
+            )
+
         with c3:
             st.metric(
                 "Progress",
-                f"{round((len(df)/len(st.session_state.all_images))*100, 2)}%",
+                f"{round((len(df) / len(st.session_state.all_images)) * 100, 2)}%",
             )
 
         st.bar_chart(df["side"].value_counts())
@@ -300,5 +358,4 @@ with tab2:
     else:
         st.info("No labels yet")
 
-st.caption("⚡ Streamlit + Supabase + Google Drive")
-
+    st.caption("⚡ Streamlit + Supabase + Google Drive")
