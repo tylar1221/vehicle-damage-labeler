@@ -38,9 +38,6 @@ FIXED_FOLDER_ID = os.getenv(
 TEMP_FOLDER = "./temp_drive"
 os.makedirs(TEMP_FOLDER, exist_ok=True)
 
-# Pagination settings
-BATCH_SIZE = 50  # Number of images to load at once
-
 
 # =============================
 # SUPABASE CONFIG
@@ -59,8 +56,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # SESSION STATE
 # =============================
 st.session_state.setdefault("images", [])
-st.session_state.setdefault("all_images", [])
-st.session_state.setdefault("batch_start", 0)
 st.session_state.setdefault("index", 0)
 st.session_state.setdefault("labels", {})
 st.session_state.setdefault("current_path", "")
@@ -88,7 +83,7 @@ def list_drive_images(folder_id: str) -> List[Dict]:
     q = f"'{folder_id}' in parents and trashed=false"
     res = (
         drive.files()
-        .list(q=q, fields="files(id,name,mimeType)", pageSize=1000)
+        .list(q=q, fields="files(id,name,mimeType)")
         .execute()
     )
 
@@ -143,149 +138,43 @@ def save_label(name: str, desc: str, side: str):
 
 
 # =============================
-# BATCH MANAGEMENT
-# =============================
-def get_unlabeled_images():
-    """Filter out already labeled images from all_images"""
-    labeled_names = set(st.session_state.labels.keys())
-    return [
-        img for img in st.session_state.all_images
-        if img["name"] not in labeled_names
-    ]
-
-
-def load_next_batch():
-    """Load the next batch of unlabeled images"""
-    unlabeled = get_unlabeled_images()
-    
-    if not unlabeled:
-        st.session_state.images = []
-        return False
-    
-    # Load next batch
-    end_idx = min(BATCH_SIZE, len(unlabeled))
-    st.session_state.images = unlabeled[:end_idx]
-    st.session_state.index = 0
-    
-    if st.session_state.images:
-        load_current_image()
-    
-    return True
-
-
-def clear_labeled_and_load_next():
-    """Clear current batch and load next unlabeled images"""
-    # Clear temp files
-    for file in os.listdir(TEMP_FOLDER):
-        file_path = os.path.join(TEMP_FOLDER, file)
-        try:
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-        except Exception as e:
-            st.warning(f"Could not delete {file}: {str(e)}")
-    
-    # Force garbage collection
-    import gc
-    gc.collect()
-    
-    # Load next batch
-    if load_next_batch():
-        st.success(f"✅ Loaded next batch of {len(st.session_state.images)} images")
-        return True
-    else:
-        st.info("🎉 All images have been labeled!")
-        return False
-
-
-# =============================
 # IMAGE LOADER
 # =============================
 def load_current_image():
-    if not st.session_state.images:
-        return
-        
     img = st.session_state.images[st.session_state.index]
-    
-    try:
-        data = download_image(img["id"])
-        image = Image.open(data)
-        path = os.path.join(TEMP_FOLDER, img["name"])
-        image.save(path)
-        
-        # Close to free memory
-        image.close()
-        data.close()
+    data = download_image(img["id"])
 
-        st.session_state.current_path = path
-        st.session_state.current_name = img["name"]
+    image = Image.open(data)
+    path = os.path.join(TEMP_FOLDER, img["name"])
+    image.save(path)
 
-        if img["name"] in st.session_state.labels:
-            st.session_state.current_side = (
-                st.session_state.labels[img["name"]].get("side", "none")
-            )
-        else:
-            st.session_state.current_side = "none"
-    except Exception as e:
-        st.error(f"Error loading image: {str(e)}")
-        st.session_state.current_path = ""
-        st.session_state.current_name = img["name"]
+    st.session_state.current_path = path
+    st.session_state.current_name = img["name"]
+
+    if img["name"] in st.session_state.labels:
+        st.session_state.current_side = (
+            st.session_state.labels[img["name"]].get("side", "none")
+        )
+    else:
+        st.session_state.current_side = "none"
 
 
 # =============================
 # INITIAL LOAD
 # =============================
-if not st.session_state.all_images:
+if not st.session_state.images:
     with st.spinner("Loading images from Google Drive..."):
-        st.session_state.all_images = list_drive_images(FIXED_FOLDER_ID)
+        st.session_state.images = list_drive_images(FIXED_FOLDER_ID)
         st.session_state.labels = load_labels()
-        
-        # Load first batch of unlabeled images
-        load_next_batch()
+
+    if st.session_state.images:
+        load_current_image()
 
 
 # =============================
 # UI
 # =============================
 st.title("📂 Vehicle Damage Labeler (ICS)")
-
-# Add stats in sidebar
-with st.sidebar:
-    st.header("📊 Progress Stats")
-    
-    total_images = len(st.session_state.all_images)
-    labeled_count = len(st.session_state.labels)
-    unlabeled_count = len(get_unlabeled_images())
-    current_batch_size = len(st.session_state.images)
-    
-    st.metric("Total Images", total_images)
-    st.metric("Labeled", labeled_count)
-    st.metric("Remaining", unlabeled_count)
-    st.metric("Current Batch", current_batch_size)
-    
-    if labeled_count > 0:
-        progress = (labeled_count / total_images) * 100
-        st.progress(progress / 100)
-        st.caption(f"{progress:.1f}% Complete")
-    
-    st.divider()
-    
-    # Batch control
-    st.subheader("🔄 Batch Control")
-    
-    if current_batch_size > 0:
-        labeled_in_batch = sum(
-            1 for img in st.session_state.images
-            if img["name"] in st.session_state.labels
-        )
-        st.info(f"{labeled_in_batch}/{current_batch_size} labeled in current batch")
-    
-    if st.button("🗑️ Clear & Load Next Batch", type="primary", use_container_width=True):
-        clear_labeled_and_load_next()
-        st.rerun()
-    
-    st.caption("💡 Use this to free memory and load new unlabeled images")
-
-
 tab1, tab2 = st.tabs(["🏷️ Labeling", "📊 Live Preview"])
 
 
@@ -294,18 +183,14 @@ tab1, tab2 = st.tabs(["🏷️ Labeling", "📊 Live Preview"])
 # =============================
 with tab1:
     if not st.session_state.images:
-        st.warning("No unlabeled images in current batch. Click 'Clear & Load Next Batch' to continue.")
-        st.stop()
-    
-    if not st.session_state.current_path or not os.path.exists(st.session_state.current_path):
-        st.error("Image not loaded. Please try navigating to another image.")
+        st.warning("No images found")
         st.stop()
 
     col1, col2 = st.columns([2, 1])
 
     # IMAGE PANEL
     with col1:
-        st.image(st.session_state.current_path, use_column_width=True)
+        st.image(st.session_state.current_path, use_container_width=True)
         st.caption(st.session_state.current_name)
 
         st.progress(
@@ -315,7 +200,7 @@ with tab1:
 
         st.caption(
             f"Image {st.session_state.index + 1} "
-            f"of {len(st.session_state.images)} (Current Batch)"
+            f"of {len(st.session_state.images)}"
         )
 
     # LABEL PANEL
