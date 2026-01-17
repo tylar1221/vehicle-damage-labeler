@@ -7,6 +7,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import pandas as pd
+import gc
 
 # =============================
 # PAGE CONFIG
@@ -78,76 +79,110 @@ def list_drive_images(folder_id: str) -> List[Dict]:
     """Fetch ALL images from folder with pagination"""
     all_files = []
     page_token = None
+    page_count = 0
     
     while True:
-        q = f"'{folder_id}' in parents and trashed=false"
-        res = drive.files().list(
-            q=q,
-            fields="nextPageToken, files(id,name,mimeType)",
-            pageSize=1000,  # Max allowed by API
-            pageToken=page_token
-        ).execute()
-        
-        files = res.get("files", [])
-        image_files = [f for f in files if f["mimeType"].startswith("image/")]
-        all_files.extend(image_files)
-        
-        page_token = res.get("nextPageToken")
-        if not page_token:
+        try:
+            page_count += 1
+            q = f"'{folder_id}' in parents and trashed=false"
+            res = drive.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,mimeType)",
+                pageSize=100,  # Fetch 100 at a time to avoid memory issues
+                pageToken=page_token
+            ).execute()
+            
+            files = res.get("files", [])
+            image_files = [f for f in files if f["mimeType"].startswith("image/")]
+            all_files.extend(image_files)
+            
+            # Show progress
+            st.write(f"Loaded page {page_count}: {len(image_files)} images (Total so far: {len(all_files)})")
+            
+            page_token = res.get("nextPageToken")
+            if not page_token:
+                break
+                
+        except Exception as e:
+            st.error(f"Error fetching images on page {page_count}: {e}")
             break
     
+    st.success(f"✅ Loaded {len(all_files)} total images from {page_count} pages")
     return all_files
 
 def download_image(file_id: str) -> io.BytesIO:
-    request = drive.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.seek(0)
-    return fh
+    """Download image with proper error handling"""
+    try:
+        request = drive.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+        return fh
+    except Exception as e:
+        st.error(f"Error downloading image: {e}")
+        return None
 
 # =============================
 # SUPABASE HELPERS
 # =============================
 
+@st.cache_data(ttl=60)  # Cache for 60 seconds
 def load_labels():
-    res = supabase.table("image_labels").select("*").execute()
-    labels = {}
-    for r in res.data:
-        labels[r["image_name"]] = {
-            "description": r["description"],
-            "side": r.get("side", "none")
-        }
-    return labels
+    """Load labels from Supabase with caching"""
+    try:
+        res = supabase.table("image_labels").select("*").execute()
+        labels = {}
+        for r in res.data:
+            labels[r["image_name"]] = {
+                "description": r["description"],
+                "side": r.get("side", "none")
+            }
+        return labels
+    except Exception as e:
+        st.error(f"Error loading labels: {e}")
+        return {}
 
 def save_label(name: str, desc: str, side: str):
-    supabase.table("image_labels").upsert({
-        "image_name": name,
-        "description": desc,
-        "side": side
-    }).execute()
-    st.session_state.labels[name] = {
-        "description": desc,
-        "side": side
-    }
+    """Save label to Supabase"""
+    try:
+        supabase.table("image_labels").upsert({
+            "image_name": name,
+            "description": desc,
+            "side": side
+        }).execute()
+        st.session_state.labels[name] = {
+            "description": desc,
+            "side": side
+        }
+        # Clear cache to refresh data
+        load_labels.clear()
+        get_unlabeled_image_names.clear()
+    except Exception as e:
+        st.error(f"Error saving label: {e}")
 
 # =============================
 # FILTER HELPERS
 # =============================
 
+@st.cache_data(ttl=60)  # Cache for 60 seconds
 def get_unlabeled_image_names():
     """Get list of image names that are NOT in Supabase"""
-    # Get all labeled image names from Supabase
-    res = supabase.table("image_labels").select("image_name").execute()
-    labeled_names = {r["image_name"] for r in res.data}
-    
-    # Find images NOT in Supabase
-    all_image_names = {img["name"] for img in st.session_state.images}
-    unlabeled_names = all_image_names - labeled_names
-    
-    return unlabeled_names
+    try:
+        # Get all labeled image names from Supabase
+        res = supabase.table("image_labels").select("image_name").execute()
+        labeled_names = {r["image_name"] for r in res.data}
+        
+        # Find images NOT in Supabase
+        all_image_names = {img["name"] for img in st.session_state.images}
+        unlabeled_names = all_image_names - labeled_names
+        
+        return unlabeled_names
+    except Exception as e:
+        st.error(f"Error getting unlabeled images: {e}")
+        return set()
 
 def get_filtered_images():
     """Return filtered list based on current filter settings"""
@@ -189,24 +224,66 @@ def jump_to_first_unlabeled():
 # IMAGE LOADER
 # =============================
 
+def cleanup_temp_files():
+    """Clean up old temporary files to prevent memory issues"""
+    try:
+        for filename in os.listdir(TEMP_FOLDER):
+            file_path = os.path.join(TEMP_FOLDER, filename)
+            # Keep only current image
+            if file_path != st.session_state.current_path:
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+    except:
+        pass
+
 def load_current_image():
+    """Load image with memory management"""
     filtered = get_filtered_images()
     if not filtered:
         return
     
-    img = filtered[st.session_state.index]
-    data = download_image(img["id"])
-    image = Image.open(data)
-    path = os.path.join(TEMP_FOLDER, img["name"])
-    image.save(path)
-    st.session_state.current_path = path
-    st.session_state.current_name = img["name"]
+    # Clean up old files first
+    cleanup_temp_files()
     
-    # Load existing side if available
-    if img["name"] in st.session_state.labels:
-        st.session_state.current_side = st.session_state.labels[img["name"]].get("side", "none")
-    else:
-        st.session_state.current_side = "none"
+    img = filtered[st.session_state.index]
+    
+    # Download image
+    data = download_image(img["id"])
+    if data is None:
+        st.error("Failed to load image")
+        return
+    
+    try:
+        # Open and save image
+        image = Image.open(data)
+        
+        # Resize large images to prevent memory issues
+        max_size = (1920, 1080)
+        image.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        path = os.path.join(TEMP_FOLDER, img["name"])
+        image.save(path, optimize=True, quality=85)
+        
+        # Close image to free memory
+        image.close()
+        data.close()
+        
+        st.session_state.current_path = path
+        st.session_state.current_name = img["name"]
+        
+        # Load existing side if available
+        if img["name"] in st.session_state.labels:
+            st.session_state.current_side = st.session_state.labels[img["name"]].get("side", "none")
+        else:
+            st.session_state.current_side = "none"
+        
+        # Force garbage collection
+        gc.collect()
+        
+    except Exception as e:
+        st.error(f"Error processing image: {e}")
 
 # =============================
 # INITIAL LOAD
@@ -235,9 +312,15 @@ with st.sidebar:
     unlabeled_count = len(unlabeled_names)
     labeled_count = total_images - unlabeled_count
     
-    st.metric("Total Images", total_images)
-    st.metric("Labeled (in Supabase)", labeled_count)
-    st.metric("Unlabeled (not in Supabase)", unlabeled_count)
+    st.metric("📂 Total Images from Drive", total_images)
+    st.metric("✅ Labeled (in Supabase)", labeled_count)
+    st.metric("⚠️ Unlabeled (not in Supabase)", unlabeled_count)
+    
+    # Progress bar
+    if total_images > 0:
+        progress_pct = labeled_count / total_images
+        st.progress(progress_pct)
+        st.caption(f"{progress_pct*100:.1f}% Complete")
     
     st.divider()
     
@@ -263,7 +346,7 @@ with st.sidebar:
             next_idx = find_next_unlabeled()
             if next_idx is not None:
                 st.session_state.index = next_idx
-                st.session_state.filter_unlabeled = False  # Turn off filter to show in context
+                st.session_state.filter_unlabeled = False
                 load_current_image()
                 st.rerun()
             else:
@@ -274,7 +357,7 @@ with st.sidebar:
             first_idx = jump_to_first_unlabeled()
             if first_idx is not None:
                 st.session_state.index = first_idx
-                st.session_state.filter_unlabeled = False  # Turn off filter to show in context
+                st.session_state.filter_unlabeled = False
                 load_current_image()
                 st.rerun()
             else:
@@ -287,6 +370,13 @@ with st.sidebar:
         st.warning("⚠️ Current image is UNLABELED")
     else:
         st.success("✅ Current image is LABELED")
+    
+    # Manual refresh button
+    if st.button("🔄 Refresh Data", use_container_width=True):
+        load_labels.clear()
+        get_unlabeled_image_names.clear()
+        st.session_state.labels = load_labels()
+        st.rerun()
 
 tab1, tab2 = st.tabs(["🏷️ Labeling", "📊 Live Preview"])
 
@@ -305,7 +395,11 @@ with tab1:
     
     # ---- IMAGE PANEL ----
     with col1:
-        st.image(st.session_state.current_path, use_container_width=True)
+        if os.path.exists(st.session_state.current_path):
+            st.image(st.session_state.current_path, use_container_width=True)
+        else:
+            st.warning("Image not loaded")
+            
         st.caption(st.session_state.current_name)
         st.progress(
             (st.session_state.index + 1) / len(filtered_images)
@@ -438,34 +532,38 @@ with tab1:
 
 with tab2:
     st.header("📊 Live Supabase Data")
-    data = supabase.table("image_labels").select("*").execute().data
-    df = pd.DataFrame(data)
     
-    if not df.empty:
-        # Statistics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Labeled Images", len(df))
-        with col2:
-            labeled = len(df[df["side"] != "none"])
-            st.metric("Images with Side Selected", labeled)
-        with col3:
+    try:
+        data = supabase.table("image_labels").select("*").execute().data
+        df = pd.DataFrame(data)
+        
+        if not df.empty:
+            # Statistics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Labeled Images", len(df))
+            with col2:
+                labeled = len(df[df["side"] != "none"])
+                st.metric("Images with Side Selected", labeled)
+            with col3:
+                if "side" in df.columns:
+                    sides_count = df[df["side"] != "none"]["side"].value_counts()
+                    if not sides_count.empty:
+                        most_common = sides_count.index[0]
+                        st.metric("Most Common Side", most_common.upper())
+            
+            # Side distribution
             if "side" in df.columns:
-                sides_count = df[df["side"] != "none"]["side"].value_counts()
-                if not sides_count.empty:
-                    most_common = sides_count.index[0]
-                    st.metric("Most Common Side", most_common.upper())
-        
-        # Side distribution
-        if "side" in df.columns:
-            st.subheader("Side Distribution")
-            side_counts = df["side"].value_counts()
-            st.bar_chart(side_counts)
-        
-        st.divider()
-        st.subheader("All Labels")
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.info("No labels yet")
+                st.subheader("Side Distribution")
+                side_counts = df["side"].value_counts()
+                st.bar_chart(side_counts)
+            
+            st.divider()
+            st.subheader("All Labels")
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No labels yet")
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
 
 st.caption("⚡ Realtime labeling powered by Streamlit + Supabase")
