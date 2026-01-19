@@ -72,6 +72,8 @@ st.session_state.setdefault("current_side", "none")
 # =============================
 @st.cache_resource
 def drive_service():
+    import certifi
+    import httplib2
     creds = service_account.Credentials.from_service_account_info(
         json.loads(SERVICE_ACCOUNT_JSON),
         scopes=SCOPES,
