@@ -74,6 +74,8 @@ st.session_state.setdefault("current_side", "none")
 def drive_service():
     import certifi
     import httplib2
+    from google_auth_httplib2 import AuthorizedHttp
+    
     creds = service_account.Credentials.from_service_account_info(
         json.loads(SERVICE_ACCOUNT_JSON),
         scopes=SCOPES,
