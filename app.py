@@ -76,7 +76,8 @@ def drive_service():
         json.loads(SERVICE_ACCOUNT_JSON),
         scopes=SCOPES,
     )
-    return build("drive", "v3", credentials=creds)
+    http=httplib2.Http(ca_certs=certifi.where())
+    return build("drive", "v3", credentials=creds, http=http,)
 
 
 drive = drive_service()
