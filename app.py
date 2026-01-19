@@ -72,17 +72,16 @@ st.session_state.setdefault("current_side", "none")
 # =============================
 @st.cache_resource
 def drive_service():
-    import certifi
-    import httplib2
-    from google_auth_httplib2 import AuthorizedHttp
+    # import certifi
+    # import httplib2
+    # from google_auth_httplib2 import AuthorizedHttp
     
     creds = service_account.Credentials.from_service_account_info(
         json.loads(SERVICE_ACCOUNT_JSON),
         scopes=SCOPES,
     )
-    http=httplib2.Http(ca_certs=certifi.where())
-    authed_http = creds.authorize(http)
-    return build("drive", "v3", credentials=creds, http=authed_http,)
+  
+    return build("drive", "v3", credentials=creds, )
 
 
 drive = drive_service()
