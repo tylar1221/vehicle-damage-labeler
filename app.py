@@ -79,7 +79,8 @@ def drive_service():
         scopes=SCOPES,
     )
     http=httplib2.Http(ca_certs=certifi.where())
-    return build("drive", "v3", credentials=creds, http=http,)
+    authed_http = creds.authorize(http)
+    return build("drive", "v3", credentials=creds, http=authed_http,)
 
 
 drive = drive_service()
