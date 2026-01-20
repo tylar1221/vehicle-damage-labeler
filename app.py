@@ -437,6 +437,8 @@ st.session_state.setdefault("current_path", "")
 st.session_state.setdefault("current_name", "")
 st.session_state.setdefault("current_side", "none")
 
+st.session_state.setdefault("last_filter_mode", "All Images")
+
 
 # =============================
 # GOOGLE DRIVE
@@ -607,7 +609,8 @@ with tab1:
 
     labeled_names = get_labeled_image_names()
 
-    if filter_mode == "Only Unlabeled":
+    if filter_mode != st.session_state.last_filter_mode:
+       if filter_mode =="Only Unlabeled":
         st.session_state.images = [
             img
             for img in st.session_state.all_images
@@ -616,7 +619,9 @@ with tab1:
         st.session_state.index = 0
     else:
         st.session_state.images = st.session_state.all_images
-
+    st.session_state.images = st.session_state.all_images
+    st.session_state.last_filter_mode = filter_mode
+    
     if not st.session_state.images:
         st.success("🎉 All images are labeled!")
         st.stop()
@@ -700,10 +705,9 @@ with tab1:
                         label.strip(),
                         side,
                     )
-                    st.session_state.index = min(
-                        st.session_state.index + 1,
-                        len(st.session_state.images) - 1,
-                    )
+                    st.session_state.index += 1
+                    if st.session_state.index >= len(st.session_stste.images):
+                        st.session_state.index = len(st.session_state.images) -1
                     st.rerun()
                 else:
                     st.warning("Description required")
