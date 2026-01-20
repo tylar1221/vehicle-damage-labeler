@@ -706,7 +706,7 @@ with tab1:
                         side,
                     )
                     st.session_state.index += 1
-                    if st.session_state.index >= len(st.session_stste.images):
+                    if st.session_state.index >= len(st.session_state.images):
                         st.session_state.index = len(st.session_state.images) -1
                     st.rerun()
                 else:
