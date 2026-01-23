@@ -982,23 +982,29 @@ def save_label(name: str, desc: str, side: str):
 # IMAGE LOADING
 # =============================
 def load_current_image():
-    """Load the current image from Drive and save to temp folder"""
+    """Load the current image from Drive and save to temp folder safely"""
     if not st.session_state.images:
         return
 
     img = st.session_state.images[st.session_state.index]
     data = download_image(img["id"])
+
     image = Image.open(data)
 
+    # 🔒 SAFETY: Convert unsupported modes for JPEG
+    if image.mode not in ("RGB", "L"):
+        image = image.convert("RGB")
+
     path = os.path.join(TEMP_FOLDER, img["name"])
-    image.save(path)
+
+    # Force JPEG-safe save
+    image.save(path, format="JPEG")
 
     st.session_state.current_path = path
     st.session_state.current_name = img["name"]
 
     label = st.session_state.labels.get(img["name"])
     st.session_state.current_side = label["side"] if label else "none"
-
 
 # =============================
 # INITIAL DATA LOADING
